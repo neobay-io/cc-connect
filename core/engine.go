@@ -6309,6 +6309,7 @@ func (e *Engine) renderCronCard(sessionKey string, notice string) *Card {
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "%s %s\n", status, desc)
 		fmt.Fprintf(&sb, "ID: `%s`\n", j.ID)
+		sb.WriteString(cronSessionLine(j, true) + "\n")
 		sb.WriteString(e.i18n.Tf(MsgCronScheduleLabel, human, j.CronExpr))
 		nextRun := e.cronScheduler.NextRun(j.ID)
 		if !nextRun.IsZero() {
@@ -6723,6 +6724,7 @@ func (e *Engine) cmdCronList(p Platform, msg *Message) {
 		fmt.Fprintf(&sb, "%s %s\n", status, desc)
 
 		fmt.Fprintf(&sb, "ID: %s\n", j.ID)
+		sb.WriteString(cronSessionLine(j, false) + "\n")
 
 		human := CronExprToHuman(j.CronExpr, lang)
 		sb.WriteString(e.i18n.Tf(MsgCronScheduleLabel, human, j.CronExpr))
@@ -6745,6 +6747,31 @@ func (e *Engine) cmdCronList(p Platform, msg *Message) {
 
 	fmt.Fprintf(&sb, "\n%s", e.i18n.T(MsgCronListFooter))
 	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+func cronSessionLine(j *CronJob, markdown bool) string {
+	if j == nil {
+		return "Session: none"
+	}
+	session := strings.TrimSpace(j.SessionLabel)
+	agentID := strings.TrimSpace(j.AgentSessionID)
+	formatValue := func(v string) string {
+		if markdown {
+			return fmt.Sprintf("`%s`", v)
+		}
+		return v
+	}
+	switch {
+	case session != "" && agentID != "":
+		session = fmt.Sprintf("%s (%s)", formatValue(session), formatValue(shortID(agentID)))
+	case session != "":
+		session = formatValue(session)
+	case agentID != "":
+		session = formatValue(shortID(agentID))
+	default:
+		session = "none"
+	}
+	return "Session: " + session
 }
 
 func (e *Engine) cmdCronDel(p Platform, msg *Message, args []string) {

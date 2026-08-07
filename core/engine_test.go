@@ -1292,6 +1292,43 @@ func TestRenderCronCard_ShowsFullPromptFirstLine(t *testing.T) {
 	}
 }
 
+func TestRenderCronCard_ShowsSessionInfo(t *testing.T) {
+	store, err := NewCronStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewCronStore: %v", err)
+	}
+	scheduler := NewCronScheduler(store)
+	e := NewEngine("test", &stubAgent{}, nil, "", LangEnglish)
+	e.SetCronScheduler(scheduler)
+
+	job := &CronJob{
+		ID:             "job-1",
+		Project:        "test",
+		SessionKey:     "feishu:chat:user",
+		CronExpr:       "* * * * *",
+		Prompt:         "Collect daily updates",
+		Enabled:        true,
+		AgentSessionID: "agent-session-123456",
+		SessionLabel:   "Nightly Review",
+		CreatedAt:      time.Now(),
+	}
+	if err := scheduler.AddJob(job); err != nil {
+		t.Fatalf("AddJob: %v", err)
+	}
+
+	card := e.renderCronCard(job.SessionKey, "")
+	if card == nil {
+		t.Fatal("expected cron card")
+	}
+	got := card.RenderText()
+	if !strings.Contains(got, "Session: `Nightly Review` (`agent-se`)") {
+		t.Fatalf("card = %q, want markdown session label and agent id", got)
+	}
+	if strings.Contains(got, "chat `feishu:chat:user`") {
+		t.Fatalf("card = %q, should not repeat chat key", got)
+	}
+}
+
 func TestFirstNonEmptyLine(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1381,6 +1418,44 @@ func TestCmdCronList_UsesFirstNonEmptyLineForShellJobs(t *testing.T) {
 	}
 	if strings.Contains(got, "second line") {
 		t.Fatalf("list = %q, should not include later exec lines", got)
+	}
+}
+
+func TestCmdCronList_ShowsSessionInfo(t *testing.T) {
+	store, err := NewCronStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewCronStore: %v", err)
+	}
+	scheduler := NewCronScheduler(store)
+	e := NewEngine("test", &stubAgent{}, nil, "", LangEnglish)
+	e.SetCronScheduler(scheduler)
+	p := &stubPlatformEngine{n: "test"}
+
+	job := &CronJob{
+		ID:             "job-1",
+		Project:        "test",
+		SessionKey:     "test:user",
+		CronExpr:       "* * * * *",
+		Prompt:         "Collect daily updates",
+		Enabled:        true,
+		AgentSessionID: "agent-session-123456",
+		SessionLabel:   "Nightly Review",
+		CreatedAt:      time.Now(),
+	}
+	if err := scheduler.AddJob(job); err != nil {
+		t.Fatalf("AddJob: %v", err)
+	}
+
+	e.cmdCronList(p, &Message{SessionKey: job.SessionKey, ReplyCtx: "ctx"})
+	if len(p.sent) == 0 {
+		t.Fatal("expected text cron list")
+	}
+	got := p.sent[len(p.sent)-1]
+	if !strings.Contains(got, "Session: Nightly Review (agent-se)") {
+		t.Fatalf("list = %q, want plain session label and agent id", got)
+	}
+	if strings.Contains(got, "`Nightly Review`") || strings.Contains(got, "chat `test:user`") {
+		t.Fatalf("list = %q, should not use markdown backticks or repeat chat key", got)
 	}
 }
 

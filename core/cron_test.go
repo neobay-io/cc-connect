@@ -351,7 +351,9 @@ func TestSetCronSessionByPrefix(t *testing.T) {
 	e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
 	e.SetCronScheduler(scheduler)
 	scheduler.RegisterEngine("test", e)
-	store.Add(&CronJob{ID: "job-1", Project: "test", SessionKey: "test:chat", CronExpr: "* * * * *", Prompt: "hi", Enabled: true})
+	if err := store.Add(&CronJob{ID: "job-1", Project: "test", SessionKey: "test:chat", CronExpr: "* * * * *", Prompt: "hi", Enabled: true}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
 
 	// Unique prefix binds.
 	if m := e.setCronSessionByPrefix("test:chat", "job-1", "abc12345"); !strings.Contains(m, "job-1") {
