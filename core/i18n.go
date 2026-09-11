@@ -601,18 +601,18 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "Prompt en cola omitido: %v",
 	},
 	MsgQueueSkippedSessionChanged: {
-		LangEnglish:            "Skipped a queued prompt because this chat switched to a different agent session.",
-		LangChinese:            "已跳过一条等待中的 prompt，因为这个聊天已经切换到其他 agent session。",
-		LangTraditionalChinese: "已跳過一條等待中的 prompt，因為這個聊天已切換到其他 agent session。",
-		LangJapanese:           "このチャットが別のエージェントセッションへ切り替わったため、待機プロンプトをスキップしました。",
-		LangSpanish:            "Se omitió un prompt en cola porque este chat cambió a otra sesión de agente.",
+		LangEnglish:            "Skipped a queued prompt because this chat switched to a different cc-connect session.",
+		LangChinese:            "已跳过一条等待中的 prompt，因为这个聊天已经切换到其他 cc-connect 会话。",
+		LangTraditionalChinese: "已跳過一條等待中的 prompt，因為這個聊天已切換到其他 cc-connect 會話。",
+		LangJapanese:           "このチャットが別の cc-connect セッションへ切り替わったため、待機プロンプトをスキップしました。",
+		LangSpanish:            "Se omitió un prompt en cola porque este chat cambió a otra sesión de cc-connect.",
 	},
 	MsgQueueCancelledOnSwitch: {
-		LangEnglish:            "\nCancelled %d queued prompt(s) from the previous agent session.",
-		LangChinese:            "\n已取消旧 agent session 下 %d 条等待中的 prompt。",
-		LangTraditionalChinese: "\n已取消舊 agent session 下 %d 條等待中的 prompt。",
-		LangJapanese:           "\n以前のエージェントセッションの待機プロンプト %d 件をキャンセルしました。",
-		LangSpanish:            "\nSe cancelaron %d prompt(s) en cola de la sesión de agente anterior.",
+		LangEnglish:            "\nCancelled %d queued prompt(s) from the previous cc-connect session.",
+		LangChinese:            "\n已取消旧 cc-connect 会话下 %d 条等待中的 prompt。",
+		LangTraditionalChinese: "\n已取消舊 cc-connect 會話下 %d 條等待中的 prompt。",
+		LangJapanese:           "\n以前の cc-connect セッションの待機プロンプト %d 件をキャンセルしました。",
+		LangSpanish:            "\nSe cancelaron %d prompt(s) en cola de la sesión anterior de cc-connect.",
 	},
 	MsgNoToolsAllowed: {
 		LangEnglish:            "No tools pre-allowed.\nUsage: `/allow <tool_name>`\nExample: `/allow Bash`",
@@ -813,10 +813,10 @@ var messages = map[MsgKey]map[Language]string{
 	MsgHelp: {
 		LangEnglish: "📖 Available Commands\n\n" +
 			"/new [name]\n  Start a new session\n\n" +
-			"/list\n  List agent sessions\n\n" +
-			"/search <keyword>\n  Search sessions by name or ID\n\n" +
+			"/list\n  List cc-connect sessions for this chat\n\n" +
+			"/search <keyword>\n  Search cc-connect sessions by name, ID, or message\n\n" +
 			"/switch <number>\n  Resume a session by its list number\n\n" +
-			"/delete <number>\n  Delete a session by its list number\n\n" +
+			"/delete <number>\n  Remove a cc-connect session; keep the Agent transcript\n\n" +
 			"/name [number] <text>\n  Name a session for easy identification\n\n" +
 			"/current\n  Show current active session\n\n" +
 			"/history [n]\n  Show last n messages (default 10)\n\n" +
@@ -854,10 +854,10 @@ var messages = map[MsgKey]map[Language]string{
 			"Permission modes: default / edit / plan / yolo",
 		LangChinese: "📖 可用命令\n\n" +
 			"/new [名称]\n  创建新会话\n\n" +
-			"/list\n  列出 Agent 会话列表\n\n" +
-			"/search <关键词>\n  搜索会话名称或 ID\n\n" +
+			"/list\n  列出当前聊天的 cc-connect 会话\n\n" +
+			"/search <关键词>\n  按名称、ID 或消息搜索 cc-connect 会话\n\n" +
 			"/switch <序号>\n  按列表序号切换会话\n\n" +
-			"/delete <序号>\n  按列表序号删除会话\n\n" +
+			"/delete <序号>\n  删除 cc-connect 会话记录；保留 Agent transcript\n\n" +
 			"/name [序号] <名称>\n  给会话命名，方便识别\n\n" +
 			"/current\n  查看当前活跃会话\n\n" +
 			"/history [n]\n  查看最近 n 条消息（默认 10）\n\n" +
@@ -895,10 +895,10 @@ var messages = map[MsgKey]map[Language]string{
 			"权限模式：default / edit / plan / yolo",
 		LangTraditionalChinese: "📖 可用命令\n\n" +
 			"/new [名稱]\n  建立新會話\n\n" +
-			"/list\n  列出 Agent 會話列表\n\n" +
-			"/search <關鍵詞>\n  搜尋會話名稱或 ID\n\n" +
+			"/list\n  列出目前聊天的 cc-connect 會話\n\n" +
+			"/search <關鍵詞>\n  按名稱、ID 或訊息搜尋 cc-connect 會話\n\n" +
 			"/switch <序號>\n  按列表序號切換會話\n\n" +
-			"/delete <序號>\n  按列表序號刪除會話\n\n" +
+			"/delete <序號>\n  刪除 cc-connect 會話記錄；保留 Agent transcript\n\n" +
 			"/name [序號] <名稱>\n  為會話命名，方便辨識\n\n" +
 			"/current\n  查看當前活躍會話\n\n" +
 			"/history [n]\n  查看最近 n 條訊息（預設 10）\n\n" +
@@ -935,9 +935,9 @@ var messages = map[MsgKey]map[Language]string{
 			"權限模式：default / edit / plan / yolo",
 		LangJapanese: "📖 利用可能なコマンド\n\n" +
 			"/new [名前]\n  新しいセッションを開始\n\n" +
-			"/list\n  エージェントセッション一覧\n\n" +
+			"/list\n  このチャットの cc-connect セッション一覧\n\n" +
 			"/switch <番号>\n  リスト番号でセッションを切り替え\n\n" +
-			"/delete <番号>\n  リスト番号でセッションを削除\n\n" +
+			"/delete <番号>\n  cc-connect セッションを削除（Agent transcript は保持）\n\n" +
 			"/name [番号] <名前>\n  セッションに名前を付ける\n\n" +
 			"/current\n  現在のアクティブセッションを表示\n\n" +
 			"/history [n]\n  直近 n 件のメッセージを表示（デフォルト 10）\n\n" +
@@ -974,9 +974,9 @@ var messages = map[MsgKey]map[Language]string{
 			"権限モード: default / edit / plan / yolo",
 		LangSpanish: "📖 Comandos disponibles\n\n" +
 			"/new [nombre]\n  Iniciar una nueva sesión\n\n" +
-			"/list\n  Listar sesiones del agente\n\n" +
+			"/list\n  Listar sesiones de cc-connect para este chat\n\n" +
 			"/switch <número>\n  Reanudar sesión por su número en la lista\n\n" +
-			"/delete <número>\n  Eliminar sesión por su número en la lista\n\n" +
+			"/delete <número>\n  Eliminar la sesión de cc-connect; conservar el transcript del Agent\n\n" +
 			"/name [número] <texto>\n  Nombrar una sesión para fácil identificación\n\n" +
 			"/current\n  Mostrar sesión activa actual\n\n" +
 			"/history [n]\n  Mostrar últimos n mensajes (por defecto 10)\n\n" +
@@ -1027,11 +1027,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "**Sesiones de %s** (%d) · Página %d/%d\n\n",
 	},
 	MsgListEmpty: {
-		LangEnglish:            "No sessions found for this project.",
-		LangChinese:            "未找到此项目的会话。",
-		LangTraditionalChinese: "未找到此項目的會話。",
-		LangJapanese:           "このプロジェクトのセッションが見つかりません。",
-		LangSpanish:            "No se encontraron sesiones para este proyecto.",
+		LangEnglish:            "No cc-connect sessions found for this chat.",
+		LangChinese:            "未找到当前聊天的 cc-connect 会话。",
+		LangTraditionalChinese: "未找到目前聊天的 cc-connect 會話。",
+		LangJapanese:           "このチャットの cc-connect セッションが見つかりません。",
+		LangSpanish:            "No se encontraron sesiones de cc-connect para este chat.",
 	},
 	MsgListMore: {
 		LangEnglish:            "\n... and %d more\n",
@@ -2290,18 +2290,18 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "✅ Nueva sesión creada: **%s**",
 	},
 	MsgDeleteUsage: {
-		LangEnglish:            "Usage: `/delete <number>` — delete a session by its list number.\nUse `/list` to see session numbers.",
-		LangChinese:            "用法：`/delete <序号>` — 按列表序号删除会话。\n使用 `/list` 查看会话序号。",
-		LangTraditionalChinese: "用法：`/delete <序號>` — 按列表序號刪除會話。\n使用 `/list` 查看會話序號。",
-		LangJapanese:           "使い方：`/delete <番号>` — リスト番号でセッションを削除。\n`/list` で番号を確認できます。",
-		LangSpanish:            "Uso: `/delete <número>` — eliminar sesión por número de lista.\nUse `/list` para ver los números.",
+		LangEnglish:            "Usage: `/delete <number>` — remove a cc-connect session by its list number. The Agent transcript is retained.\nUse `/list` to see session numbers.",
+		LangChinese:            "用法：`/delete <序号>` — 按列表序号删除 cc-connect 会话记录，Agent transcript 会保留。\n使用 `/list` 查看会话序号。",
+		LangTraditionalChinese: "用法：`/delete <序號>` — 按列表序號刪除 cc-connect 會話記錄，Agent transcript 會保留。\n使用 `/list` 查看會話序號。",
+		LangJapanese:           "使い方：`/delete <番号>` — リスト番号で cc-connect セッションを削除します。Agent transcript は保持されます。\n`/list` で番号を確認できます。",
+		LangSpanish:            "Uso: `/delete <número>` — eliminar una sesión de cc-connect por número. El transcript del Agent se conserva.\nUse `/list` para ver los números.",
 	},
 	MsgDeleteSuccess: {
-		LangEnglish:            "🗑️ Session deleted: %s",
-		LangChinese:            "🗑️ 会话已删除：%s",
-		LangTraditionalChinese: "🗑️ 會話已刪除：%s",
-		LangJapanese:           "🗑️ セッション削除：%s",
-		LangSpanish:            "🗑️ Sesión eliminada: %s",
+		LangEnglish:            "🗑️ cc-connect session removed: %s. Agent transcript retained.",
+		LangChinese:            "🗑️ cc-connect 会话记录已删除：%s。Agent transcript 已保留。",
+		LangTraditionalChinese: "🗑️ cc-connect 會話記錄已刪除：%s。Agent transcript 已保留。",
+		LangJapanese:           "🗑️ cc-connect セッションを削除しました：%s。Agent transcript は保持されています。",
+		LangSpanish:            "🗑️ Sesión de cc-connect eliminada: %s. Se conservó el transcript del Agent.",
 	},
 	MsgSwitchSuccess: {
 		LangEnglish:            "✅ Switched to: %s (%s, %d msgs)",
@@ -2553,11 +2553,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "❌ Este agente no soporta archivos de instrucciones.",
 	},
 	MsgSearchUsage: {
-		LangEnglish:            "Usage: /search <keyword>\nSearch sessions by name or ID.",
-		LangChinese:            "用法: /search <关键词>\n搜索会话名称或 ID。",
-		LangTraditionalChinese: "用法: /search <關鍵詞>\n搜尋會話名稱或 ID。",
-		LangJapanese:           "使い方: /search <キーワード>\nセッション名またはIDで検索。",
-		LangSpanish:            "Uso: /search <palabra_clave>\nBuscar sesiones por nombre o ID.",
+		LangEnglish:            "Usage: /search <keyword>\nSearch cc-connect sessions by name, ID, or message content.",
+		LangChinese:            "用法: /search <关键词>\n按名称、ID 或消息内容搜索 cc-connect 会话。",
+		LangTraditionalChinese: "用法: /search <關鍵詞>\n按名稱、ID 或訊息內容搜尋 cc-connect 會話。",
+		LangJapanese:           "使い方: /search <キーワード>\ncc-connect セッションを名前、ID、メッセージ内容で検索。",
+		LangSpanish:            "Uso: /search <palabra_clave>\nBuscar sesiones de cc-connect por nombre, ID o contenido del mensaje.",
 	},
 	MsgSearchError: {
 		LangEnglish:            "❌ Search error: %v",
@@ -2596,18 +2596,18 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "Iniciar una nueva sesión, arg: [nombre]",
 	},
 	MsgBuiltinCmdList: {
-		LangEnglish:            "List agent sessions",
-		LangChinese:            "列出 Agent 会话列表",
-		LangTraditionalChinese: "列出 Agent 會話列表",
-		LangJapanese:           "エージェントセッション一覧",
-		LangSpanish:            "Listar sesiones del agente",
+		LangEnglish:            "List cc-connect sessions",
+		LangChinese:            "列出 cc-connect 会话列表",
+		LangTraditionalChinese: "列出 cc-connect 會話列表",
+		LangJapanese:           "cc-connect セッション一覧",
+		LangSpanish:            "Listar sesiones de cc-connect",
 	},
 	MsgBuiltinCmdSearch: {
-		LangEnglish:            "Search sessions by name or ID, arg: <keyword>",
-		LangChinese:            "搜索会话名称或 ID，参数: <关键词>",
-		LangTraditionalChinese: "搜尋會話名稱或 ID，參數: <關鍵詞>",
-		LangJapanese:           "セッションを名前またはIDで検索、引数: <キーワード>",
-		LangSpanish:            "Buscar sesiones por nombre o ID, arg: <palabra_clave>",
+		LangEnglish:            "Search sessions by name, ID, or message, arg: <keyword>",
+		LangChinese:            "搜索会话名称、ID 或消息内容，参数: <关键词>",
+		LangTraditionalChinese: "搜尋會話名稱、ID 或訊息內容，參數: <關鍵詞>",
+		LangJapanese:           "名前、ID、メッセージでセッションを検索、引数: <キーワード>",
+		LangSpanish:            "Buscar sesiones por nombre, ID o mensaje, arg: <palabra_clave>",
 	},
 	MsgBuiltinCmdSwitch: {
 		LangEnglish:            "Resume a session by its list number, arg: <number>",
@@ -2617,11 +2617,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "Reanudar sesión por su número en la lista, arg: <número>",
 	},
 	MsgBuiltinCmdDelete: {
-		LangEnglish:            "Delete a session by its list number, arg: <number>",
-		LangChinese:            "按列表序号删除会话，参数: <序号>",
-		LangTraditionalChinese: "按列表序號刪除會話，參數: <序號>",
-		LangJapanese:           "リスト番号でセッションを削除、引数: <番号>",
-		LangSpanish:            "Eliminar sesión por su número en la lista, arg: <número>",
+		LangEnglish:            "Remove a cc-connect session; Agent transcript retained, arg: <number>",
+		LangChinese:            "删除 cc-connect 会话并保留 Agent transcript，参数: <序号>",
+		LangTraditionalChinese: "刪除 cc-connect 會話並保留 Agent transcript，參數: <序號>",
+		LangJapanese:           "cc-connect セッションを削除（Agent transcript は保持）、引数: <番号>",
+		LangSpanish:            "Eliminar sesión de cc-connect; se conserva el transcript del Agent, arg: <número>",
 	},
 	MsgBuiltinCmdName: {
 		LangEnglish:            "Name a session for easy identification, arg: [number] <text>",

@@ -282,7 +282,7 @@ func TestCancelQueuedPromptsCancelsEmptySnapshot(t *testing.T) {
 	}}
 	e.promptQueueMu.Unlock()
 
-	if n := e.cancelQueuedPromptsForSessionSwitch("test:chat", ""); n != 2 {
+	if n := e.cancelQueuedPromptsForSessionSwitch("test:chat", "new-local", ""); n != 2 {
 		t.Fatalf("cancelled = %d, want 2 (both empty and old snapshots)", n)
 	}
 }

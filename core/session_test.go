@@ -152,6 +152,81 @@ func TestSessionManagerRenameActiveSession(t *testing.T) {
 	}
 }
 
+func TestSessionManagerRenameSession(t *testing.T) {
+	sm := NewSessionManager("")
+	first := sm.NewSession("user1", "first")
+	sm.NewSession("user1", "second")
+
+	renamed := sm.RenameSession("user1", first.ID, "renamed")
+	if renamed == nil || renamed.Name != "renamed" {
+		t.Fatalf("expected first session to be renamed, got %#v", renamed)
+	}
+	if got := sm.ActiveSessionID("user1"); got == first.ID {
+		t.Fatalf("renaming changed active session to %q", got)
+	}
+}
+
+func TestSessionManagerDeleteSession(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "sessions.json")
+	sm := NewSessionManager(storePath)
+	first := sm.NewSession("user1", "first")
+	active := sm.NewSession("user1", "active")
+
+	deleted, err := sm.DeleteSession("user1", first.ID)
+	if err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if deleted.ID != first.ID {
+		t.Fatalf("deleted session = %q, want %q", deleted.ID, first.ID)
+	}
+	if got := sm.ListSessions("user1"); len(got) != 1 || got[0].ID != active.ID {
+		t.Fatalf("remaining sessions = %#v, want active session only", got)
+	}
+	reloaded := NewSessionManager(storePath)
+	if got := reloaded.ListSessions("user1"); len(got) != 1 || got[0].ID != active.ID {
+		t.Fatalf("reloaded sessions = %#v, want active session only", got)
+	}
+
+	if _, err := sm.DeleteSession("user1", active.ID); err != errCannotDeleteActiveSession {
+		t.Fatalf("delete active error = %v, want %v", err, errCannotDeleteActiveSession)
+	}
+}
+
+func TestSessionManagerDeleteSessionClearsNameAfterFinalAgentReference(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "sessions.json")
+	sm := NewSessionManager(storePath)
+	first := sm.NewSession("user1", "first")
+	active1 := sm.NewSession("user1", "active-1")
+	second := sm.NewSession("user2", "second")
+	active2 := sm.NewSession("user2", "active-2")
+	first.AgentSessionID = "shared-agent"
+	second.AgentSessionID = "shared-agent"
+	sm.SetSessionName("shared-agent", "shared name")
+
+	if _, err := sm.DeleteSession("user1", first.ID); err != nil {
+		t.Fatalf("DeleteSession first: %v", err)
+	}
+	if got := sm.GetSessionName("shared-agent"); got != "shared name" {
+		t.Fatalf("name after deleting one reference = %q, want retained", got)
+	}
+	if _, err := sm.DeleteSession("user2", second.ID); err != nil {
+		t.Fatalf("DeleteSession second: %v", err)
+	}
+	if got := sm.GetSessionName("shared-agent"); got != "" {
+		t.Fatalf("name after deleting final reference = %q, want cleared", got)
+	}
+	if got := sm.ActiveSessionID("user1"); got != active1.ID {
+		t.Fatalf("user1 active session = %q, want %q", got, active1.ID)
+	}
+	if got := sm.ActiveSessionID("user2"); got != active2.ID {
+		t.Fatalf("user2 active session = %q, want %q", got, active2.ID)
+	}
+	reloaded := NewSessionManager(storePath)
+	if got := reloaded.GetSessionName("shared-agent"); got != "" {
+		t.Fatalf("reloaded stale agent-session name = %q, want empty", got)
+	}
+}
+
 func TestSessionManagerRenameByAgentSessionID(t *testing.T) {
 	sm := NewSessionManager("")
 	s := sm.NewSession("user1", "draft")

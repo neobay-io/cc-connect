@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,6 +20,7 @@ type queuedPrompt struct {
 	ID                     string
 	QueueKey               string
 	OriginSessionKey       string
+	OriginLocalSessionID   string
 	OriginPlatform         string
 	AgentSessionIDSnapshot string
 	Source                 string // "" / "user" = interactive; "cron" = scheduled job
@@ -40,6 +42,16 @@ type promptQueueSnapshot struct {
 	Items    []queuedPrompt
 }
 
+// lockSessionTransition serializes interactive startup with local-session
+// replacement for one chat. Entries intentionally live for the Engine lifetime,
+// matching the lifetime of the SessionManager records keyed by sessionKey.
+func (e *Engine) lockSessionTransition(sessionKey string) func() {
+	value, _ := e.sessionTransitions.LoadOrStore(sessionKey, &sync.Mutex{})
+	lock := value.(*sync.Mutex)
+	lock.Lock()
+	return lock.Unlock
+}
+
 // promptQueueKey returns (queueKey, agentSessionIDSnapshot).
 //
 // The queue is serialized per chat entry (sessionKey): a cron turn and a user
@@ -48,8 +60,9 @@ type promptQueueSnapshot struct {
 // use different agent sessions). The key stays stable across a turn's lifetime,
 // so completePromptTurn's key-migration branch is a no-op.
 //
-// The second value is still the agent session id, used only as a snapshot guard
-// (startQueuedPrompt skips a queued item if the active session's id changed).
+// The second value is the agent session id. User prompts also snapshot the local
+// cc-connect session id separately so switching between two local sessions that
+// share one agent transcript cannot reroute queued work or history.
 func (e *Engine) promptQueueKey(sessionKey string, session *Session) (string, string) {
 	_, agentSessionID := e.agentSessionTurnIdentity(session)
 	return "grp:" + sessionKey, strings.TrimSpace(agentSessionID)
@@ -107,7 +120,7 @@ func promptQueuePreview(content string) string {
 	return content
 }
 
-func (e *Engine) beginPromptTurnOrEnqueue(queueKey, agentSessionID string, msg *Message) (bool, int, error) {
+func (e *Engine) beginPromptTurnOrEnqueue(queueKey, localSessionID, agentSessionID string, msg *Message) (bool, int, error) {
 	e.promptQueueMu.Lock()
 	defer e.promptQueueMu.Unlock()
 
@@ -117,14 +130,14 @@ func (e *Engine) beginPromptTurnOrEnqueue(queueKey, agentSessionID string, msg *
 		e.promptQueues[queueKey] = state
 	}
 	if state.Running || len(state.Items) > 0 {
-		pos, err := e.enqueuePromptLocked(state, queueKey, agentSessionID, "user", "", msg)
+		pos, err := e.enqueuePromptLocked(state, queueKey, localSessionID, agentSessionID, "user", "", msg)
 		return false, pos, err
 	}
 	state.Running = true
 	return true, 0, nil
 }
 
-func (e *Engine) enqueuePrompt(queueKey, agentSessionID string, msg *Message) (int, error) {
+func (e *Engine) enqueuePrompt(queueKey, localSessionID, agentSessionID string, msg *Message) (int, error) {
 	e.promptQueueMu.Lock()
 	defer e.promptQueueMu.Unlock()
 
@@ -133,10 +146,10 @@ func (e *Engine) enqueuePrompt(queueKey, agentSessionID string, msg *Message) (i
 		state = &promptQueueState{}
 		e.promptQueues[queueKey] = state
 	}
-	return e.enqueuePromptLocked(state, queueKey, agentSessionID, "user", "", msg)
+	return e.enqueuePromptLocked(state, queueKey, localSessionID, agentSessionID, "user", "", msg)
 }
 
-func (e *Engine) enqueuePromptLocked(state *promptQueueState, queueKey, agentSessionID, source, jobID string, msg *Message) (int, error) {
+func (e *Engine) enqueuePromptLocked(state *promptQueueState, queueKey, localSessionID, agentSessionID, source, jobID string, msg *Message) (int, error) {
 	if len(state.Items) >= maxPromptQueueItems {
 		return 0, fmt.Errorf("queue full")
 	}
@@ -156,6 +169,7 @@ func (e *Engine) enqueuePromptLocked(state *promptQueueState, queueKey, agentSes
 		ID:                     fmt.Sprintf("q%d", e.promptQueueSeq),
 		QueueKey:               queueKey,
 		OriginSessionKey:       msg.SessionKey,
+		OriginLocalSessionID:   strings.TrimSpace(localSessionID),
 		OriginPlatform:         msg.Platform,
 		AgentSessionIDSnapshot: strings.TrimSpace(agentSessionID),
 		Source:                 source,
@@ -304,7 +318,14 @@ func (e *Engine) failQueuedPrompt(item queuedPrompt, reason string) {
 }
 
 func (e *Engine) startQueuedPrompt(item queuedPrompt) bool {
+	unlockTransition := e.lockSessionTransition(item.OriginSessionKey)
+	defer unlockTransition()
+
 	session := e.sessions.GetOrCreateActive(item.OriginSessionKey)
+	if item.OriginLocalSessionID != "" && session.ID != item.OriginLocalSessionID {
+		e.failQueuedPrompt(item, e.i18n.T(MsgQueueSkippedSessionChanged))
+		return true
+	}
 	_, currentAgentSessionID := e.promptQueueKey(item.OriginSessionKey, session)
 	if item.AgentSessionIDSnapshot != "" && currentAgentSessionID != item.AgentSessionIDSnapshot {
 		e.failQueuedPrompt(item, e.i18n.T(MsgQueueSkippedSessionChanged))
@@ -323,7 +344,9 @@ func (e *Engine) startQueuedPrompt(item queuedPrompt) bool {
 	}
 	msg := item.Message
 	msg.ReplyCtx = replyCtx
-	go e.processInteractiveMessageAndDrainQueue(p, &msg, session, item.QueueKey)
+	started := make(chan struct{})
+	go e.processInteractiveMessageAndDrainQueueWithStartSignal(p, &msg, session, item.QueueKey, started)
+	<-started
 	return true
 }
 
@@ -382,7 +405,7 @@ func (e *Engine) beginCronTurnOrEnqueue(job *CronJob, sessionKey string, msg *Me
 		e.promptQueues[queueKey] = state
 	}
 	if state.Running || len(state.Items) > 0 {
-		_, err := e.enqueuePromptLocked(state, queueKey, agentSessionID, "cron", job.ID, msg)
+		_, err := e.enqueuePromptLocked(state, queueKey, "", agentSessionID, "cron", job.ID, msg)
 		return false, err
 	}
 	state.Running = true
@@ -406,7 +429,11 @@ func (e *Engine) platformAndReplyContextForQueuedPrompt(item queuedPrompt) (Plat
 }
 
 func (e *Engine) processInteractiveMessageAndDrainQueue(p Platform, msg *Message, session *Session, queueKey string) {
-	e.processInteractiveMessage(p, msg, session)
+	e.processInteractiveMessageAndDrainQueueWithStartSignal(p, msg, session, queueKey, nil)
+}
+
+func (e *Engine) processInteractiveMessageAndDrainQueueWithStartSignal(p Platform, msg *Message, session *Session, queueKey string, started chan struct{}) {
+	e.processInteractiveMessageWithStartSignal(p, msg, session, started)
 	finalKey := e.completePromptTurn(queueKey, msg.SessionKey, session)
 	e.drainPromptQueue(finalKey)
 }
@@ -450,7 +477,7 @@ func (e *Engine) queueSnapshotForSession(sessionKey string) promptQueueSnapshot 
 	return promptQueueSnapshot{QueueKey: queueKey, Running: state.Running, Items: items}
 }
 
-func (e *Engine) cancelQueuedPromptsForSessionSwitch(sessionKey, newAgentSessionID string) int {
+func (e *Engine) cancelQueuedPromptsForSessionSwitch(sessionKey, newLocalSessionID, newAgentSessionID string) int {
 	e.promptQueueMu.Lock()
 	defer e.promptQueueMu.Unlock()
 
@@ -461,8 +488,10 @@ func (e *Engine) cancelQueuedPromptsForSessionSwitch(sessionKey, newAgentSession
 		}
 		kept := state.Items[:0]
 		for _, item := range state.Items {
-			if item.OriginSessionKey == sessionKey &&
-				(item.AgentSessionIDSnapshot == "" || item.AgentSessionIDSnapshot != newAgentSessionID) {
+			localSessionChanged := !item.isCron() &&
+				(item.OriginLocalSessionID == "" || item.OriginLocalSessionID != newLocalSessionID)
+			agentSessionChanged := item.AgentSessionIDSnapshot == "" || item.AgentSessionIDSnapshot != newAgentSessionID
+			if item.OriginSessionKey == sessionKey && (localSessionChanged || agentSessionChanged) {
 				cancelled++
 				continue
 			}

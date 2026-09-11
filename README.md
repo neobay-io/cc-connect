@@ -779,8 +779,9 @@ Each user gets an independent session with full conversation context. Manage ses
 
 ```
 /new [name]       Start a new session
-/list             List all agent sessions for this project
-/switch <id>      Switch to a different session
+/list             List cc-connect sessions for this chat
+/switch <number>  Switch to a listed cc-connect session
+/delete <number>  Remove a cc-connect session (Agent transcript retained)
 /current          Show current session info
 /history [n]      Show last n messages (default 10)
 /provider [...]   Manage API providers (list/add/remove/switch)

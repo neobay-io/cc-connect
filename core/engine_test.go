@@ -411,6 +411,56 @@ func (a *listDeleteAgent) DeleteSession(_ context.Context, id string) error {
 	return nil
 }
 
+type transitionBlockingAgent struct {
+	startEntered chan struct{}
+	releaseStart chan struct{}
+	startOnce    sync.Once
+}
+
+func newTransitionBlockingAgent() *transitionBlockingAgent {
+	return &transitionBlockingAgent{
+		startEntered: make(chan struct{}),
+		releaseStart: make(chan struct{}),
+	}
+}
+
+func (a *transitionBlockingAgent) Name() string { return "transition-blocking" }
+func (a *transitionBlockingAgent) StartSession(ctx context.Context, sessionID string) (AgentSession, error) {
+	a.startOnce.Do(func() { close(a.startEntered) })
+	select {
+	case <-a.releaseStart:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return &transitionBlockingSession{
+		sessionID: sessionID,
+		events:    make(chan Event, 2),
+	}, nil
+}
+func (a *transitionBlockingAgent) ListSessions(context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *transitionBlockingAgent) Stop() error { return nil }
+
+type transitionBlockingSession struct {
+	sessionID string
+	events    chan Event
+	closeOnce sync.Once
+}
+
+func (s *transitionBlockingSession) Send(string, []ImageAttachment, []FileAttachment) error {
+	s.events <- Event{Type: EventResult, SessionID: s.sessionID, Done: true}
+	return nil
+}
+func (s *transitionBlockingSession) RespondPermission(string, PermissionResult) error { return nil }
+func (s *transitionBlockingSession) Events() <-chan Event                             { return s.events }
+func (s *transitionBlockingSession) CurrentSessionID() string                         { return s.sessionID }
+func (s *transitionBlockingSession) Alive() bool                                      { return true }
+func (s *transitionBlockingSession) Close() error {
+	s.closeOnce.Do(func() { close(s.events) })
+	return nil
+}
+
 type recordingSendSession struct {
 	mu     sync.Mutex
 	sends  []recordedSend
@@ -832,14 +882,16 @@ func TestCmdLoopList_FeishuUsesCardButtons(t *testing.T) {
 }
 
 func TestCmdList_FeishuUsesSessionCardButtons(t *testing.T) {
-	agent := &listDeleteAgent{sessions: []AgentSessionInfo{
-		{ID: "sess-1", Summary: "First session", MessageCount: 3, ModifiedAt: time.Now()},
-		{ID: "sess-2", Summary: "Second session", MessageCount: 5, ModifiedAt: time.Now()},
-	}}
+	agent := &listDeleteAgent{}
 	p := &stubCardPlatform{n: "feishu"}
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 
 	msg := &Message{SessionKey: "feishu:chat:user", ReplyCtx: "ctx"}
+	first := e.sessions.NewSession(msg.SessionKey, "First session")
+	first.AddHistory("user", "one")
+	second := e.sessions.NewSession(msg.SessionKey, "Second session")
+	second.AddHistory("user", "two")
+	second.AddHistory("assistant", "three")
 	e.cmdList(p, msg, nil)
 
 	p.mu.Lock()
@@ -858,11 +910,60 @@ func TestCmdList_FeishuUsesSessionCardButtons(t *testing.T) {
 			values = append(values, btn.Data)
 		}
 	}
-	if !slices.Contains(values, "act:/sessions switch sess-1 1") {
+	if !slices.Contains(values, "act:/sessions switch "+first.ID+" 1") {
 		t.Fatalf("buttons = %#v, want switch action", values)
 	}
-	if !slices.Contains(values, "act:/sessions delete sess-1 1") {
+	if !slices.Contains(values, "act:/sessions delete "+first.ID+" 1") {
 		t.Fatalf("buttons = %#v, want delete action", values)
+	}
+	if !strings.Contains(rendered, second.ID) || !strings.Contains(rendered, "**2** msgs") {
+		t.Fatalf("card = %q, want local session id and message count", rendered)
+	}
+}
+
+func TestCmdDeleteRemovesLocalSessionWithoutDeletingAgentTranscript(t *testing.T) {
+	agent := &listDeleteAgent{sessions: []AgentSessionInfo{{ID: "agent-transcript"}}}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user"
+
+	deleted := e.sessions.NewSession(sessionKey, "old")
+	deleted.AgentSessionID = "agent-transcript"
+	active := e.sessions.NewSession(sessionKey, "current")
+
+	e.cmdDelete(p, &Message{SessionKey: sessionKey, ReplyCtx: "ctx"}, []string{"1"})
+
+	if len(agent.deleted) != 0 {
+		t.Fatalf("agent transcripts deleted = %#v, want none", agent.deleted)
+	}
+	remaining := e.sessions.ListSessions(sessionKey)
+	if len(remaining) != 1 || remaining[0].ID != active.ID {
+		t.Fatalf("remaining local sessions = %#v, want active session only", remaining)
+	}
+	if len(p.sent) == 0 || !strings.Contains(p.sent[len(p.sent)-1], "old") {
+		t.Fatalf("sent = %#v, want deleted local session name", p.sent)
+	}
+}
+
+func TestCmdSearchUsesLocalSessionHistory(t *testing.T) {
+	agent := &listDeleteAgent{sessions: []AgentSessionInfo{{
+		ID:      "agent-only",
+		Summary: "agent transcript should not be searched",
+	}}}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user"
+
+	local := e.sessions.NewSession(sessionKey, "local session")
+	local.AddHistory("user", "find this local-history-token")
+	e.cmdSearch(p, &Message{SessionKey: sessionKey, ReplyCtx: "ctx"}, []string{"local-history-token"})
+
+	if len(p.sent) == 0 || !strings.Contains(p.sent[len(p.sent)-1], local.ID) {
+		t.Fatalf("sent = %#v, want matching local session", p.sent)
+	}
+	e.cmdSearch(p, &Message{SessionKey: sessionKey, ReplyCtx: "ctx"}, []string{"agent transcript"})
+	if !strings.Contains(p.sent[len(p.sent)-1], "No sessions found") {
+		t.Fatalf("sent = %#v, agent transcript unexpectedly appeared in local search", p.sent)
 	}
 }
 
@@ -966,27 +1067,77 @@ func TestCmdModel_FeishuUsesStableAgentSpecificButtons(t *testing.T) {
 }
 
 func TestExecuteCardAction_SessionsSwitchAndDelete(t *testing.T) {
-	agent := &listDeleteAgent{sessions: []AgentSessionInfo{
-		{ID: "sess-1", Summary: "First session", MessageCount: 3, ModifiedAt: time.Now()},
-		{ID: "sess-2", Summary: "Second session", MessageCount: 5, ModifiedAt: time.Now()},
-	}}
+	agent := &listDeleteAgent{}
 	e := NewEngine("test", agent, nil, "", LangEnglish)
 	sessionKey := "feishu:chat:user"
+	first := e.sessions.NewSession(sessionKey, "First session")
+	second := e.sessions.NewSession(sessionKey, "Second session")
+	second.AgentSessionID = "agent-session-2"
+	if _, err := e.sessions.SwitchSession(sessionKey, first.ID); err != nil {
+		t.Fatalf("SwitchSession: %v", err)
+	}
 
-	notice := e.executeCardAction("/sessions", "switch sess-2", sessionKey)
+	notice := e.executeCardAction("/sessions", "switch "+second.ID, sessionKey)
 	if !strings.Contains(notice, "Second session") {
 		t.Fatalf("switch notice = %q, want switched session", notice)
 	}
-	if got := e.sessions.GetOrCreateActive(sessionKey).AgentSessionID; got != "sess-2" {
-		t.Fatalf("active agent session = %q, want sess-2", got)
+	if got := e.sessions.ActiveSessionID(sessionKey); got != second.ID {
+		t.Fatalf("active local session = %q, want %q", got, second.ID)
 	}
 
-	notice = e.executeCardAction("/sessions", "delete sess-1", sessionKey)
+	notice = e.executeCardAction("/sessions", "delete "+first.ID, sessionKey)
 	if !strings.Contains(notice, "First session") {
 		t.Fatalf("delete notice = %q, want deleted session", notice)
 	}
-	if !slices.Contains(agent.deleted, "sess-1") {
-		t.Fatalf("deleted = %#v, want sess-1", agent.deleted)
+	if got := e.sessions.ListSessions(sessionKey); len(got) != 1 || got[0].ID != second.ID {
+		t.Fatalf("remaining local sessions = %#v, want second session only", got)
+	}
+	if len(agent.deleted) != 0 {
+		t.Fatalf("agent transcripts deleted = %#v, want none", agent.deleted)
+	}
+}
+
+func TestLocalSessionCommandsRejectAmbiguousPrefixes(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &listDeleteAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user"
+
+	first := e.sessions.NewSession(sessionKey, "first")
+	var tenth *Session
+	for i := 2; i <= 11; i++ {
+		s := e.sessions.NewSession(sessionKey, fmt.Sprintf("session-%d", i))
+		if i == 10 {
+			tenth = s
+		}
+	}
+	activeID := e.sessions.ActiveSessionID(sessionKey)
+	if _, err := e.sessions.DeleteSession(sessionKey, first.ID); err != nil {
+		t.Fatalf("DeleteSession first: %v", err)
+	}
+
+	e.cmdSwitch(p, &Message{SessionKey: sessionKey, ReplyCtx: "ctx"}, []string{"s1"})
+	if got := e.sessions.ActiveSessionID(sessionKey); got != activeID {
+		t.Fatalf("ambiguous-prefix switch changed active session to %q", got)
+	}
+	e.cmdDelete(p, &Message{SessionKey: sessionKey, ReplyCtx: "ctx"}, []string{"s1"})
+	if matched := matchLocalSession(e.localSessionList(sessionKey), tenth.ID); matched == nil {
+		t.Fatalf("ambiguous-prefix delete removed %q", tenth.ID)
+	}
+}
+
+func TestMatchLocalSessionRejectsAmbiguousNamesAndAgentIDs(t *testing.T) {
+	sessions := []localSessionInfo{
+		{ID: "s1", Name: "duplicate", AgentSessionID: "shared-agent"},
+		{ID: "s2", Name: "duplicate", AgentSessionID: "shared-agent"},
+	}
+	if got := matchLocalSession(sessions, "duplicate"); got != nil {
+		t.Fatalf("duplicate name matched %#v, want nil", got)
+	}
+	if got := matchLocalSession(sessions, "shared-agent"); got != nil {
+		t.Fatalf("shared agent id matched %#v, want nil", got)
+	}
+	if got := matchLocalSession(sessions, "s1"); got == nil || got.ID != "s1" {
+		t.Fatalf("exact local id matched %#v, want s1", got)
 	}
 }
 
@@ -1159,19 +1310,18 @@ func TestHandleMessageBlocksNewTurnDuringAgentUpgrade(t *testing.T) {
 }
 
 func TestHandleCardNav_SessionsActionPreservesPage(t *testing.T) {
-	sessions := make([]AgentSessionInfo, 25)
-	for i := range sessions {
-		sessions[i] = AgentSessionInfo{
-			ID:           fmt.Sprintf("sess-%02d", i+1),
-			Summary:      fmt.Sprintf("Session %02d", i+1),
-			MessageCount: i + 1,
-			ModifiedAt:   time.Now(),
+	agent := &listDeleteAgent{}
+	e := NewEngine("test", agent, nil, "", LangEnglish)
+	sessionKey := "feishu:chat:user"
+	var session21 *Session
+	for i := 0; i < 25; i++ {
+		s := e.sessions.NewSession(sessionKey, fmt.Sprintf("Session %02d", i+1))
+		if i == 20 {
+			session21 = s
 		}
 	}
-	agent := &listDeleteAgent{sessions: sessions}
-	e := NewEngine("test", agent, nil, "", LangEnglish)
 
-	card := e.handleCardNav("act:/sessions delete sess-21 2", "feishu:chat:user")
+	card := e.handleCardNav("act:/sessions delete "+session21.ID+" 2", sessionKey)
 	if card == nil {
 		t.Fatal("expected session card")
 	}
@@ -1185,19 +1335,14 @@ func TestHandleCardNav_SessionsActionPreservesPage(t *testing.T) {
 }
 
 func TestRenderSessionCard_PageTwoBackReturnsToPageOne(t *testing.T) {
-	sessions := make([]AgentSessionInfo, 25)
-	for i := range sessions {
-		sessions[i] = AgentSessionInfo{
-			ID:           fmt.Sprintf("sess-%02d", i+1),
-			Summary:      fmt.Sprintf("Session %02d", i+1),
-			MessageCount: i + 1,
-			ModifiedAt:   time.Now(),
-		}
-	}
-	agent := &listDeleteAgent{sessions: sessions}
+	agent := &listDeleteAgent{}
 	e := NewEngine("test", agent, nil, "", LangEnglish)
+	sessionKey := "feishu:chat:user"
+	for i := 0; i < 25; i++ {
+		e.sessions.NewSession(sessionKey, fmt.Sprintf("Session %02d", i+1))
+	}
 
-	card := e.renderSessionCard("feishu:chat:user", 2, "")
+	card := e.renderSessionCard(sessionKey, 2, "")
 	if card == nil {
 		t.Fatal("expected session card")
 	}
@@ -2883,7 +3028,7 @@ func TestPromptQueue_RequeueRetryAfterSessionUnlock(t *testing.T) {
 	session := e.sessions.GetOrCreateActive("test:user1")
 	session.AgentSessionID = "agent-session-1"
 	queueKey, agentSessionID := e.promptQueueKey("test:user1", session)
-	if _, err := e.enqueuePrompt(queueKey, agentSessionID, &Message{
+	if _, err := e.enqueuePrompt(queueKey, session.ID, agentSessionID, &Message{
 		SessionKey: "test:user1",
 		Platform:   "test",
 		UserID:     "user1",
@@ -2943,21 +3088,23 @@ func TestExecuteCustomCommand_DrainsPromptQueueAfterCompletion(t *testing.T) {
 }
 
 func TestCmdSwitchCancelsPendingSnapshotQueuedPrompts(t *testing.T) {
-	agent := &listDeleteAgent{sessions: []AgentSessionInfo{{
-		ID:           "target-agent-session",
-		Summary:      "target",
-		MessageCount: 3,
-		ModifiedAt:   time.Now(),
-	}}}
+	agent := &listDeleteAgent{}
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 
-	session := e.sessions.GetOrCreateActive("test:user1")
+	sessionKey := "test:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	target := e.sessions.NewSession(sessionKey, "target")
+	target.AgentSessionID = "target-agent-session"
+	target.AddHistory("user", "preserved")
+	if _, err := e.sessions.SwitchSession(sessionKey, session.ID); err != nil {
+		t.Fatalf("SwitchSession: %v", err)
+	}
 	queueKey, agentSessionID := e.promptQueueKey("test:user1", session)
 	if agentSessionID != "" {
 		t.Fatalf("agentSessionID = %q, want empty pending snapshot", agentSessionID)
 	}
-	if _, err := e.enqueuePrompt(queueKey, agentSessionID, &Message{
+	if _, err := e.enqueuePrompt(queueKey, session.ID, agentSessionID, &Message{
 		SessionKey: "test:user1",
 		Platform:   "test",
 		UserID:     "user1",
@@ -2968,6 +3115,12 @@ func TestCmdSwitchCancelsPendingSnapshotQueuedPrompts(t *testing.T) {
 	}
 
 	e.cmdSwitch(p, &Message{SessionKey: "test:user1", Platform: "test", ReplyCtx: "ctx"}, []string{"target-agent-session"})
+	if got := e.sessions.ActiveSessionID(sessionKey); got != target.ID {
+		t.Fatalf("active session = %q, want %q", got, target.ID)
+	}
+	if got := len(target.GetHistory(0)); got != 1 {
+		t.Fatalf("target history count = %d, want preserved history", got)
+	}
 
 	if snap := e.queueSnapshotForSession("test:user1"); len(snap.Items) != 0 {
 		t.Fatalf("queue items after switch = %#v, want none", snap.Items)
@@ -2977,12 +3130,157 @@ func TestCmdSwitchCancelsPendingSnapshotQueuedPrompts(t *testing.T) {
 	}, "switch cancellation notice")
 }
 
+func TestCmdSwitchCancelsQueuedPromptWhenLocalSessionChangesWithSharedAgentID(t *testing.T) {
+	agent := &listDeleteAgent{}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user1"
+
+	origin := e.sessions.NewSession(sessionKey, "origin")
+	origin.AgentSessionID = "shared-agent-session"
+	target := e.sessions.NewSession(sessionKey, "target")
+	target.AgentSessionID = "shared-agent-session"
+	if _, err := e.sessions.SwitchSession(sessionKey, origin.ID); err != nil {
+		t.Fatalf("SwitchSession: %v", err)
+	}
+	queueKey, agentSessionID := e.promptQueueKey(sessionKey, origin)
+	if _, err := e.enqueuePrompt(queueKey, origin.ID, agentSessionID, &Message{
+		SessionKey: sessionKey,
+		Platform:   "test",
+		Content:    "must stay with origin",
+		ReplyCtx:   "ctx",
+	}); err != nil {
+		t.Fatalf("enqueuePrompt: %v", err)
+	}
+
+	e.cmdSwitch(p, &Message{SessionKey: sessionKey, Platform: "test", ReplyCtx: "ctx"}, []string{target.ID})
+
+	if got := e.sessions.ActiveSessionID(sessionKey); got != target.ID {
+		t.Fatalf("active session = %q, want %q", got, target.ID)
+	}
+	if snap := e.queueSnapshotForSession(sessionKey); len(snap.Items) != 0 {
+		t.Fatalf("queue items after local switch = %#v, want none", snap.Items)
+	}
+	if len(p.sent) == 0 || !strings.Contains(p.sent[len(p.sent)-1], "Cancelled 1 queued") {
+		t.Fatalf("sent = %#v, want queue cancellation notice", p.sent)
+	}
+}
+
+func TestStartQueuedPromptRejectsChangedLocalSessionWithSharedAgentID(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &listDeleteAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user1"
+
+	origin := e.sessions.NewSession(sessionKey, "origin")
+	origin.AgentSessionID = "shared-agent-session"
+	target := e.sessions.NewSession(sessionKey, "target")
+	target.AgentSessionID = "shared-agent-session"
+	queueKey, _ := e.promptQueueKey(sessionKey, origin)
+	item := queuedPrompt{
+		ID:                     "q1",
+		QueueKey:               queueKey,
+		OriginSessionKey:       sessionKey,
+		OriginLocalSessionID:   origin.ID,
+		OriginPlatform:         "test",
+		AgentSessionIDSnapshot: "shared-agent-session",
+		Message:                Message{SessionKey: sessionKey, Platform: "test", Content: "must not run"},
+	}
+
+	if !e.startQueuedPrompt(item) {
+		t.Fatal("startQueuedPrompt should consume mismatched item")
+	}
+	if got := target.GetHistory(0); len(got) != 0 {
+		t.Fatalf("target history = %#v, mismatched prompt should not run", got)
+	}
+	if snap := e.queueSnapshotForSession(sessionKey); len(snap.Items) != 0 {
+		t.Fatalf("queue items = %#v, mismatched prompt should not be requeued", snap.Items)
+	}
+}
+
+func TestQueuedPromptStartupSerializesWithSessionSwitch(t *testing.T) {
+	agent := newTransitionBlockingAgent()
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user1"
+
+	origin := e.sessions.NewSession(sessionKey, "origin")
+	origin.AgentSessionID = "origin-agent-session"
+	target := e.sessions.NewSession(sessionKey, "target")
+	target.AgentSessionID = "target-agent-session"
+	if _, err := e.sessions.SwitchSession(sessionKey, origin.ID); err != nil {
+		t.Fatalf("SwitchSession: %v", err)
+	}
+
+	queueKey, _ := e.promptQueueKey(sessionKey, origin)
+	e.promptQueueMu.Lock()
+	e.promptQueues[queueKey] = &promptQueueState{Running: true}
+	e.promptQueueMu.Unlock()
+	item := queuedPrompt{
+		ID:                     "q1",
+		QueueKey:               queueKey,
+		OriginSessionKey:       sessionKey,
+		OriginLocalSessionID:   origin.ID,
+		OriginPlatform:         "test",
+		AgentSessionIDSnapshot: origin.AgentSessionID,
+		Message: Message{
+			SessionKey: sessionKey,
+			Platform:   "test",
+			Content:    "queued before switch",
+			ReplyCtx:   "ctx",
+		},
+	}
+
+	startDone := make(chan bool, 1)
+	go func() { startDone <- e.startQueuedPrompt(item) }()
+	select {
+	case <-agent.startEntered:
+	case <-time.After(time.Second):
+		t.Fatal("queued prompt did not reach agent startup")
+	}
+
+	switchDone := make(chan struct{})
+	go func() {
+		e.cmdSwitch(p, &Message{SessionKey: sessionKey, Platform: "test", ReplyCtx: "ctx"}, []string{target.ID})
+		close(switchDone)
+	}()
+	select {
+	case <-switchDone:
+		t.Fatal("session switch completed while queued prompt startup was in progress")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(agent.releaseStart)
+	select {
+	case started := <-startDone:
+		if !started {
+			t.Fatal("queued prompt was unexpectedly requeued")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued prompt startup did not finish")
+	}
+	select {
+	case <-switchDone:
+	case <-time.After(time.Second):
+		t.Fatal("session switch did not finish after queued startup")
+	}
+
+	if got := e.sessions.ActiveSessionID(sessionKey); got != target.ID {
+		t.Fatalf("active session = %q, want %q", got, target.ID)
+	}
+	e.interactiveMu.Lock()
+	_, staleState := e.interactiveStates[sessionKey]
+	e.interactiveMu.Unlock()
+	if staleState {
+		t.Fatal("old queued prompt recreated interactive state after the switch")
+	}
+}
+
 func TestPromptQueueRejectsOversizedAudio(t *testing.T) {
 	e := newTestEngine()
 	session := e.sessions.GetOrCreateActive("test:user1")
 	queueKey, agentSessionID := e.promptQueueKey("test:user1", session)
 
-	_, err := e.enqueuePrompt(queueKey, agentSessionID, &Message{
+	_, err := e.enqueuePrompt(queueKey, session.ID, agentSessionID, &Message{
 		SessionKey: "test:user1",
 		Platform:   "test",
 		UserID:     "user1",

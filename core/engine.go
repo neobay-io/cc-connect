@@ -177,6 +177,7 @@ type Engine struct {
 	agentSessionBindMu sync.RWMutex
 	agentSessionTurnMu sync.Mutex
 	agentSessionTurns  map[string]*agentSessionTurnLock // key = agentName + ":" + AgentSessionID
+	sessionTransitions sync.Map                         // sessionKey -> *sync.Mutex
 	promptQueueMu      sync.Mutex
 	promptQueues       map[string]*promptQueueState
 	promptQueueSeq     uint64
@@ -864,7 +865,7 @@ func (e *Engine) ExecuteCronJob(ctx context.Context, job *CronJob) error {
 		e.promptQueueMu.Lock()
 		if state := e.promptQueues[queueKey]; state != nil {
 			state.Running = false
-			_, _ = e.enqueuePromptLocked(state, queueKey, "", "cron", job.ID, msg)
+			_, _ = e.enqueuePromptLocked(state, queueKey, "", "", "cron", job.ID, msg)
 		}
 		e.promptQueueMu.Unlock()
 		e.schedulePromptQueueRetry(queueKey)
@@ -1306,7 +1307,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 			return
 		}
-		pos, err := e.enqueuePrompt(queueKey, agentSessionID, msg)
+		pos, err := e.enqueuePrompt(queueKey, session.ID, agentSessionID, msg)
 		if err != nil {
 			e.reply(p, msg.ReplyCtx, e.promptQueueErrorMessage(err))
 			return
@@ -1323,7 +1324,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		go e.processInteractiveMessageWithQueueLifecycle(p, msg, session)
 		return
 	}
-	startNow, pos, err := e.beginPromptTurnOrEnqueue(queueKey, agentSessionID, msg)
+	startNow, pos, err := e.beginPromptTurnOrEnqueue(queueKey, session.ID, agentSessionID, msg)
 	if err != nil {
 		session.Unlock()
 		e.reply(p, msg.ReplyCtx, e.promptQueueErrorMessage(err))
@@ -2455,6 +2456,17 @@ func isDenyResponse(s string) bool {
 // ──────────────────────────────────────────────────────────────
 
 func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Session) {
+	e.processInteractiveMessageWithStartSignal(p, msg, session, nil)
+}
+
+func (e *Engine) processInteractiveMessageWithStartSignal(p Platform, msg *Message, session *Session, started chan struct{}) {
+	signalStarted := func() {
+		if started != nil {
+			close(started)
+			started = nil
+		}
+	}
+	defer signalStarted()
 	defer session.Unlock()
 
 	if e.ctx.Err() != nil {
@@ -2546,6 +2558,10 @@ func (e *Engine) processInteractiveMessage(p Platform, msg *Message, session *Se
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
 
+	// A session transition may proceed once this turn has bound and sent to its
+	// agent state. Before this point, switching could let this state be created
+	// after cleanup and then reused by the newly active local session.
+	signalStarted()
 	e.processInteractiveEvents(state, session, msg.SessionKey, msg.MessageID, turnStart, agentTurn)
 }
 
@@ -3443,6 +3459,9 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 }
 
 func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
+	unlockTransition := e.lockSessionTransition(msg.SessionKey)
+	defer unlockTransition()
+
 	slog.Info("cmdNew: cleaning up old session", "session_key", msg.SessionKey)
 	e.cleanupInteractiveState(msg.SessionKey)
 	slog.Info("cmdNew: cleanup done, creating new session", "session_key", msg.SessionKey)
@@ -3454,7 +3473,7 @@ func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
 	// Fix3: the new session must not inherit prompts queued against the old one.
 	// With the stable group queue key, items enqueued before the first agent id
 	// bound keep an empty snapshot and would otherwise run in this new session.
-	e.cancelQueuedPromptsForSessionSwitch(msg.SessionKey, s.AgentSessionID)
+	e.cancelQueuedPromptsForSessionSwitch(msg.SessionKey, s.ID, s.AgentSessionID)
 	if name != "" {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgNewSessionCreatedName), name))
 	} else {
@@ -3465,18 +3484,42 @@ func (e *Engine) cmdNew(p Platform, msg *Message, args []string) {
 
 const listPageSize = 20
 
-func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
-	agentSessions, err := e.agent.ListSessions(e.ctx)
-	if err != nil {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgListError), err))
-		return
+type localSessionInfo struct {
+	ID             string
+	Name           string
+	AgentSessionID string
+	MessageCount   int
+	UpdatedAt      time.Time
+}
+
+func (e *Engine) localSessionList(sessionKey string) []localSessionInfo {
+	sessions := e.sessions.ListSessions(sessionKey)
+	items := make([]localSessionInfo, 0, len(sessions))
+	for _, session := range sessions {
+		if session == nil {
+			continue
+		}
+		session.mu.Lock()
+		items = append(items, localSessionInfo{
+			ID:             session.ID,
+			Name:           session.Name,
+			AgentSessionID: session.AgentSessionID,
+			MessageCount:   len(session.History),
+			UpdatedAt:      session.UpdatedAt,
+		})
+		session.mu.Unlock()
 	}
-	if len(agentSessions) == 0 {
+	return items
+}
+
+func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
+	sessions := e.localSessionList(msg.SessionKey)
+	if len(sessions) == 0 {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgListEmpty))
 		return
 	}
 
-	total := len(agentSessions)
+	total := len(sessions)
 	totalPages := (total + listPageSize - 1) / listPageSize
 
 	page := 1
@@ -3500,43 +3543,40 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 		end = total
 	}
 
-	agentName := e.agent.Name()
-	activeSession := e.sessions.GetOrCreateActive(msg.SessionKey)
-	activeAgentID := activeSession.AgentSessionID
+	activeSessionID := e.sessions.ActiveSessionID(msg.SessionKey)
 
 	var sb strings.Builder
 	if totalPages > 1 {
-		fmt.Fprintf(&sb, e.i18n.T(MsgListTitlePaged), agentName, total, page, totalPages)
+		fmt.Fprintf(&sb, e.i18n.T(MsgListTitlePaged), e.name, total, page, totalPages)
 	} else {
-		fmt.Fprintf(&sb, e.i18n.T(MsgListTitle), agentName, total)
+		fmt.Fprintf(&sb, e.i18n.T(MsgListTitle), e.name, total)
 	}
 	for i := start; i < end; i++ {
-		s := agentSessions[i]
+		s := sessions[i]
 		marker := "◻"
-		if s.ID == activeAgentID {
+		if s.ID == activeSessionID {
 			marker = "▶"
 		}
-		displayName := e.sessions.GetSessionName(s.ID)
-		if displayName != "" {
-			displayName = "📌 " + displayName
-		} else {
-			displayName = strings.ReplaceAll(s.Summary, "\n", " ")
-			displayName = strings.Join(strings.Fields(displayName), " ")
-			if displayName == "" {
-				displayName = "(empty)"
-			}
-			if len([]rune(displayName)) > 40 {
-				displayName = string([]rune(displayName)[:40]) + "…"
-			}
-		}
-		fmt.Fprintf(&sb, "%s **%d.** %s · **%d** msgs · %s\n",
-			marker, i+1, displayName, s.MessageCount, s.ModifiedAt.Format("01-02 15:04"))
+		fmt.Fprintf(&sb, "%s **%d.** %s · `%s` · **%d** msgs · %s\n",
+			marker, i+1, localSessionDisplayName(s), s.ID, s.MessageCount, s.UpdatedAt.Format("01-02 15:04"))
 	}
 	if totalPages > 1 {
 		fmt.Fprintf(&sb, e.i18n.T(MsgListPageHint), page, totalPages)
 	}
 	sb.WriteString(e.i18n.T(MsgListSwitchHint))
 	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+func localSessionDisplayName(s localSessionInfo) string {
+	displayName := strings.ReplaceAll(s.Name, "\n", " ")
+	displayName = strings.Join(strings.Fields(displayName), " ")
+	if displayName == "" {
+		displayName = "(unnamed)"
+	}
+	if len([]rune(displayName)) > 40 {
+		displayName = string([]rune(displayName)[:40]) + "…"
+	}
+	return displayName
 }
 
 func sessionDisplayName(sm *SessionManager, s AgentSessionInfo) string {
@@ -3585,15 +3625,12 @@ func parseSessionCardPage(args string) int {
 }
 
 func (e *Engine) renderSessionCard(sessionKey string, page int, notice string) *Card {
-	agentSessions, err := e.agent.ListSessions(e.ctx)
-	if err != nil {
-		return e.simpleCard("Sessions", "orange", fmt.Sprintf(e.i18n.T(MsgListError), err))
-	}
-	if len(agentSessions) == 0 {
+	sessions := e.localSessionList(sessionKey)
+	if len(sessions) == 0 {
 		return e.simpleCard("Sessions", "blue", e.i18n.T(MsgListEmpty))
 	}
 
-	total := len(agentSessions)
+	total := len(sessions)
 	totalPages := (total + listPageSize - 1) / listPageSize
 	if page < 1 {
 		page = 1
@@ -3608,12 +3645,11 @@ func (e *Engine) renderSessionCard(sessionKey string, page int, notice string) *
 		end = total
 	}
 
-	activeSession := e.sessions.GetOrCreateActive(sessionKey)
-	activeAgentID := activeSession.AgentSessionID
+	activeSessionID := e.sessions.ActiveSessionID(sessionKey)
 
-	title := fmt.Sprintf("%s Sessions", e.agent.Name())
+	title := fmt.Sprintf("%s Sessions", e.name)
 	if totalPages > 1 {
-		title = fmt.Sprintf("%s Sessions (%d/%d)", e.agent.Name(), page, totalPages)
+		title = fmt.Sprintf("%s Sessions (%d/%d)", e.name, page, totalPages)
 	}
 
 	cb := NewCard().Title(title, "blue")
@@ -3622,16 +3658,16 @@ func (e *Engine) renderSessionCard(sessionKey string, page int, notice string) *
 	}
 
 	for i := start; i < end; i++ {
-		s := agentSessions[i]
+		s := sessions[i]
 		marker := "◻"
-		if s.ID == activeAgentID {
+		if s.ID == activeSessionID {
 			marker = "▶"
 		}
-		cb.Markdown(fmt.Sprintf("%s **%d.** %s · **%d** msgs · %s",
-			marker, i+1, sessionDisplayName(e.sessions, s), s.MessageCount, s.ModifiedAt.Format("01-02 15:04")))
+		cb.Markdown(fmt.Sprintf("%s **%d.** %s · `%s` · **%d** msgs · %s",
+			marker, i+1, localSessionDisplayName(s), s.ID, s.MessageCount, s.UpdatedAt.Format("01-02 15:04")))
 
 		var btns []CardButton
-		if s.ID == activeAgentID {
+		if s.ID == activeSessionID {
 			btns = append(btns, PrimaryBtn("Current", fmt.Sprintf("nav:/sessions %d", page)))
 		} else {
 			btns = append(btns, DefaultBtn("Switch", fmt.Sprintf("act:/sessions switch %s %d", s.ID, page)))
@@ -4034,19 +4070,15 @@ func parseAttachCardPage(args string) int {
 
 func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	if len(args) == 0 {
-		e.reply(p, msg.ReplyCtx, "Usage: /switch <number | id_prefix | name>")
+		e.reply(p, msg.ReplyCtx, "Usage: /switch <number | local_id | name>")
 		return
 	}
+	unlockTransition := e.lockSessionTransition(msg.SessionKey)
+	defer unlockTransition()
+
 	query := strings.TrimSpace(strings.Join(args, " "))
 
-	slog.Info("cmdSwitch: listing agent sessions", "session_key", msg.SessionKey)
-	agentSessions, err := e.agent.ListSessions(e.ctx)
-	if err != nil {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
-		return
-	}
-
-	matched := e.matchSession(agentSessions, query)
+	matched := matchLocalSession(e.localSessionList(msg.SessionKey), query)
 	if matched == nil {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), query))
 		return
@@ -4056,22 +4088,14 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	e.cleanupInteractiveState(msg.SessionKey)
 	slog.Info("cmdSwitch: cleanup done", "session_key", msg.SessionKey)
 
-	session := e.sessions.GetOrCreateActive(msg.SessionKey)
-	session.AgentSessionID = matched.ID
-	session.Name = matched.Summary
-	session.ClearHistory()
-	e.sessions.Save()
-	cancelled := e.cancelQueuedPromptsForSessionSwitch(msg.SessionKey, matched.ID)
+	session, err := e.sessions.SwitchSession(msg.SessionKey, matched.ID)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
+		return
+	}
+	cancelled := e.cancelQueuedPromptsForSessionSwitch(msg.SessionKey, matched.ID, matched.AgentSessionID)
 
-	shortID := matched.ID
-	if len(shortID) > 12 {
-		shortID = shortID[:12]
-	}
-	displayName := e.sessions.GetSessionName(matched.ID)
-	if displayName == "" {
-		displayName = matched.Summary
-	}
-	reply := e.i18n.Tf(MsgSwitchSuccess, displayName, shortID, matched.MessageCount)
+	reply := e.i18n.Tf(MsgSwitchSuccess, localSessionDisplayName(*matched), session.ID, matched.MessageCount)
 	if cancelled > 0 {
 		reply += e.i18n.Tf(MsgQueueCancelledOnSwitch, cancelled)
 	}
@@ -4079,48 +4103,62 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 }
 
 func (e *Engine) switchSessionByID(sessionKey, id string) string {
-	agentSessions, err := e.agent.ListSessions(e.ctx)
-	if err != nil {
-		return fmt.Sprintf("❌ %v", err)
-	}
+	unlockTransition := e.lockSessionTransition(sessionKey)
+	defer unlockTransition()
 
-	var matched *AgentSessionInfo
-	for i := range agentSessions {
-		if agentSessions[i].ID == id {
-			matched = &agentSessions[i]
-			break
-		}
-	}
+	matched := matchLocalSession(e.localSessionList(sessionKey), id)
 	if matched == nil {
 		return fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), id)
 	}
 
 	e.cleanupInteractiveState(sessionKey)
 
-	session := e.sessions.GetOrCreateActive(sessionKey)
-	session.AgentSessionID = matched.ID
-	session.Name = matched.Summary
-	session.ClearHistory()
-	e.sessions.Save()
-	cancelled := e.cancelQueuedPromptsForSessionSwitch(sessionKey, matched.ID)
+	session, err := e.sessions.SwitchSession(sessionKey, matched.ID)
+	if err != nil {
+		return fmt.Sprintf("❌ %v", err)
+	}
+	cancelled := e.cancelQueuedPromptsForSessionSwitch(sessionKey, matched.ID, matched.AgentSessionID)
 
-	shortID := matched.ID
-	if len(shortID) > 12 {
-		shortID = shortID[:12]
-	}
-	displayName := e.sessions.GetSessionName(matched.ID)
-	if displayName == "" {
-		displayName = matched.Summary
-	}
-	reply := e.i18n.Tf(MsgSwitchSuccess, displayName, shortID, matched.MessageCount)
+	reply := e.i18n.Tf(MsgSwitchSuccess, localSessionDisplayName(*matched), session.ID, matched.MessageCount)
 	if cancelled > 0 {
 		reply += e.i18n.Tf(MsgQueueCancelledOnSwitch, cancelled)
 	}
 	return reply
 }
 
+func matchLocalSession(sessions []localSessionInfo, query string) *localSessionInfo {
+	if len(sessions) == 0 {
+		return nil
+	}
+	if idx, err := strconv.Atoi(query); err == nil && idx >= 1 && idx <= len(sessions) {
+		return &sessions[idx-1]
+	}
+
+	// Local IDs are short (s1, s10), so accepting prefixes is unsafe. Names and
+	// agent IDs are accepted only when an exact match identifies one local session.
+	for i := range sessions {
+		if sessions[i].ID == query {
+			return &sessions[i]
+		}
+	}
+	var matched *localSessionInfo
+	for i := range sessions {
+		if strings.EqualFold(sessions[i].Name, query) ||
+			(sessions[i].AgentSessionID != "" && sessions[i].AgentSessionID == query) {
+			if matched != nil {
+				return nil
+			}
+			matched = &sessions[i]
+		}
+	}
+	if matched != nil {
+		return matched
+	}
+	return nil
+}
+
 // matchSession resolves a user query to an agent session. Priority:
-//  1. Numeric index (1-based, matching /list output)
+//  1. Numeric index (1-based, matching the caller's displayed agent-session list)
 //  2. Exact custom name match (case-insensitive)
 //  3. Session ID prefix match
 //  4. Custom name prefix match (case-insensitive)
@@ -4277,53 +4315,40 @@ func (e *Engine) cmdSearch(p Platform, msg *Message, args []string) {
 
 	keyword := strings.ToLower(strings.Join(args, " "))
 
-	// Get all agent sessions
-	agentSessions, err := e.agent.ListSessions(e.ctx)
-	if err != nil {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSearchError), err))
-		return
-	}
-
 	type searchResult struct {
 		id           string
 		name         string
-		summary      string
-		matchType    string // "name" or "message"
 		messageCount int
 	}
 
 	var results []searchResult
-
-	for _, s := range agentSessions {
-		// Check session name (custom name or summary)
-		customName := e.sessions.GetSessionName(s.ID)
-		displayName := customName
-		if displayName == "" {
-			displayName = s.Summary
+	localSessions := e.localSessionList(msg.SessionKey)
+	storedSessions := e.sessions.ListSessions(msg.SessionKey)
+	storedByID := make(map[string]*Session, len(storedSessions))
+	for _, session := range storedSessions {
+		if session != nil {
+			storedByID[session.ID] = session
 		}
-
-		// Match by name/summary
-		if strings.Contains(strings.ToLower(displayName), keyword) {
+	}
+	for _, s := range localSessions {
+		displayName := localSessionDisplayName(s)
+		matched := strings.Contains(strings.ToLower(displayName), keyword) ||
+			strings.Contains(strings.ToLower(s.ID), keyword) ||
+			(s.AgentSessionID != "" && strings.Contains(strings.ToLower(s.AgentSessionID), keyword))
+		if !matched && storedByID[s.ID] != nil {
+			for _, entry := range storedByID[s.ID].GetHistory(0) {
+				if strings.Contains(strings.ToLower(entry.Content), keyword) {
+					matched = true
+					break
+				}
+			}
+		}
+		if matched {
 			results = append(results, searchResult{
 				id:           s.ID,
 				name:         displayName,
-				summary:      s.Summary,
-				matchType:    "name",
 				messageCount: s.MessageCount,
 			})
-			continue
-		}
-
-		// Match by session ID prefix
-		if strings.HasPrefix(strings.ToLower(s.ID), keyword) {
-			results = append(results, searchResult{
-				id:           s.ID,
-				name:         displayName,
-				summary:      s.Summary,
-				matchType:    "id",
-				messageCount: s.MessageCount,
-			})
-			continue
 		}
 	}
 
@@ -4337,11 +4362,7 @@ func (e *Engine) cmdSearch(p Platform, msg *Message, args []string) {
 	fmt.Fprintf(&sb, e.i18n.T(MsgSearchResult), len(results), keyword)
 
 	for i, r := range results {
-		shortID := r.id
-		if len(shortID) > 12 {
-			shortID = shortID[:12]
-		}
-		fmt.Fprintf(&sb, "\n%d. [%s] %s", i+1, shortID, r.name)
+		fmt.Fprintf(&sb, "\n%d. [%s] %s (%d msgs)", i+1, r.id, r.name, r.messageCount)
 	}
 
 	sb.WriteString("\n\n" + e.i18n.T(MsgSearchHint))
@@ -4357,8 +4378,8 @@ func (e *Engine) cmdName(p Platform, msg *Message, args []string) {
 
 	current := e.sessions.GetOrCreateActive(msg.SessionKey)
 
-	// Check if first arg is a number → naming a specific session by list index
-	var targetID string
+	// Check if first arg is a number -> naming a specific local session by list index.
+	var target localSessionInfo
 	var name string
 
 	if idx, err := strconv.Atoi(args[0]); err == nil && idx >= 1 {
@@ -4367,20 +4388,18 @@ func (e *Engine) cmdName(p Platform, msg *Message, args []string) {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNameUsage))
 			return
 		}
-		agentSessions, err := e.agent.ListSessions(e.ctx)
-		if err != nil {
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
-			return
-		}
-		if idx > len(agentSessions) {
+		sessions := e.localSessionList(msg.SessionKey)
+		if idx > len(sessions) {
 			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoSession), idx))
 			return
 		}
-		targetID = agentSessions[idx-1].ID
+		target = sessions[idx-1]
 		name = strings.Join(args[1:], " ")
 	} else {
-		// /name <name...> → current local session (and linked agent session if present)
-		targetID = current.AgentSessionID
+		// /name <name...> -> current local session (and linked agent session if present).
+		current.mu.Lock()
+		target = localSessionInfo{ID: current.ID, AgentSessionID: current.AgentSessionID}
+		current.mu.Unlock()
 		name = strings.Join(args, " ")
 	}
 
@@ -4390,27 +4409,14 @@ func (e *Engine) cmdName(p Platform, msg *Message, args []string) {
 		return
 	}
 
-	if idx, err := strconv.Atoi(args[0]); err == nil && idx >= 1 {
-		e.sessions.RenameByAgentSessionID(targetID, name)
-		if targetID != "" {
-			e.sessions.SetSessionName(targetID, name)
-		}
-	} else {
-		e.sessions.RenameActiveSession(msg.SessionKey, name)
-		if targetID != "" {
-			e.sessions.SetSessionName(targetID, name)
-		}
-	}
-
-	shortID := targetID
-	if shortID == "" {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgNameSet), name, "local"))
+	if e.sessions.RenameSession(msg.SessionKey, target.ID, name) == nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), target.ID))
 		return
 	}
-	if len(shortID) > 12 {
-		shortID = shortID[:12]
+	if target.AgentSessionID != "" {
+		e.sessions.SetSessionName(target.AgentSessionID, name)
 	}
-	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgNameSet), name, shortID))
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgNameSet), name, target.ID))
 }
 
 func (e *Engine) cmdCurrent(p Platform, msg *Message) {
@@ -7793,114 +7799,52 @@ func (e *Engine) cmdAliasDel(p Platform, msg *Message, args []string) {
 }
 
 func (e *Engine) cmdDelete(p Platform, msg *Message, args []string) {
-	deleter, ok := e.agent.(SessionDeleter)
-	if !ok {
-		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDeleteNotSupported))
-		return
-	}
-
 	if len(args) == 0 {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDeleteUsage))
 		return
 	}
 
-	agentSessions, err := e.agent.ListSessions(e.ctx)
-	if err != nil {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
-		return
-	}
-
-	prefix := strings.TrimSpace(args[0])
-	var matched *AgentSessionInfo
-
-	if idx, err := strconv.Atoi(prefix); err == nil && idx >= 1 && idx <= len(agentSessions) {
-		matched = &agentSessions[idx-1]
-	} else {
-		for i := range agentSessions {
-			if strings.HasPrefix(agentSessions[i].ID, prefix) {
-				matched = &agentSessions[i]
-				break
-			}
-		}
-	}
-
+	query := strings.TrimSpace(strings.Join(args, " "))
+	matched := matchLocalSession(e.localSessionList(msg.SessionKey), query)
 	if matched == nil {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), prefix))
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), query))
 		return
 	}
 
-	// Prevent deleting the currently active session
-	activeSession := e.sessions.GetOrCreateActive(msg.SessionKey)
-	if activeSession.AgentSessionID == matched.ID {
+	if e.sessions.ActiveSessionID(msg.SessionKey) == matched.ID {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDeleteActiveDenied))
 		return
 	}
 
-	displayName := e.sessions.GetSessionName(matched.ID)
-	if displayName == "" {
-		displayName = matched.Summary
-	}
-	if displayName == "" {
-		shortID := matched.ID
-		if len(shortID) > 12 {
-			shortID = shortID[:12]
+	if _, err := e.sessions.DeleteSession(msg.SessionKey, matched.ID); err != nil {
+		if err == errCannotDeleteActiveSession {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDeleteActiveDenied))
+			return
 		}
-		displayName = shortID
-	}
-
-	if err := deleter.DeleteSession(e.ctx, matched.ID); err != nil {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
 		return
 	}
 
-	e.sessions.SetSessionName(matched.ID, "")
-	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgDeleteSuccess), displayName))
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgDeleteSuccess), localSessionDisplayName(*matched)))
 }
 
 func (e *Engine) deleteSessionByID(sessionKey, id string) string {
-	deleter, ok := e.agent.(SessionDeleter)
-	if !ok {
-		return e.i18n.T(MsgDeleteNotSupported)
-	}
-
-	agentSessions, err := e.agent.ListSessions(e.ctx)
-	if err != nil {
-		return fmt.Sprintf("❌ %v", err)
-	}
-
-	var matched *AgentSessionInfo
-	for i := range agentSessions {
-		if agentSessions[i].ID == id {
-			matched = &agentSessions[i]
-			break
-		}
-	}
+	matched := matchLocalSession(e.localSessionList(sessionKey), id)
 	if matched == nil {
 		return fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), id)
 	}
 
-	activeSession := e.sessions.GetOrCreateActive(sessionKey)
-	if activeSession.AgentSessionID == matched.ID {
+	if e.sessions.ActiveSessionID(sessionKey) == matched.ID {
 		return e.i18n.T(MsgDeleteActiveDenied)
 	}
 
-	displayName := e.sessions.GetSessionName(matched.ID)
-	if displayName == "" {
-		displayName = matched.Summary
-	}
-	if displayName == "" {
-		shortID := matched.ID
-		if len(shortID) > 12 {
-			shortID = shortID[:12]
+	if _, err := e.sessions.DeleteSession(sessionKey, matched.ID); err != nil {
+		if err == errCannotDeleteActiveSession {
+			return e.i18n.T(MsgDeleteActiveDenied)
 		}
-		displayName = shortID
-	}
-
-	if err := deleter.DeleteSession(e.ctx, matched.ID); err != nil {
 		return fmt.Sprintf("❌ %v", err)
 	}
-	e.sessions.SetSessionName(matched.ID, "")
-	return fmt.Sprintf(e.i18n.T(MsgDeleteSuccess), displayName)
+	return fmt.Sprintf(e.i18n.T(MsgDeleteSuccess), localSessionDisplayName(*matched))
 }
 
 // truncateIf truncates s to maxLen runes. 0 means no truncation.

@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"sync"
 	"time"
 )
+
+var errCannotDeleteActiveSession = errors.New("cannot delete active session")
 
 // Session tracks one conversation between a user and the agent.
 type Session struct {
@@ -210,6 +213,77 @@ func (sm *SessionManager) SwitchSession(userKey, target string) (*Session, error
 	return nil, fmt.Errorf("session %q not found", target)
 }
 
+// RenameSession renames one local session owned by userKey.
+func (sm *SessionManager) RenameSession(userKey, sessionID, name string) *Session {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	for _, sid := range sm.userSessions[userKey] {
+		if sid != sessionID {
+			continue
+		}
+		s := sm.sessions[sid]
+		if s == nil {
+			return nil
+		}
+		s.mu.Lock()
+		s.Name = name
+		s.UpdatedAt = time.Now()
+		s.mu.Unlock()
+		sm.saveLocked()
+		return s
+	}
+	return nil
+}
+
+// DeleteSession removes one inactive local session owned by userKey. The
+// linked agent transcript is intentionally left intact.
+func (sm *SessionManager) DeleteSession(userKey, sessionID string) (*Session, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.activeSession[userKey] == sessionID {
+		return nil, errCannotDeleteActiveSession
+	}
+
+	ids := sm.userSessions[userKey]
+	for i, sid := range ids {
+		if sid != sessionID {
+			continue
+		}
+		s := sm.sessions[sid]
+		if s == nil {
+			return nil, fmt.Errorf("session %q not found", sessionID)
+		}
+		s.mu.Lock()
+		agentSessionID := strings.TrimSpace(s.AgentSessionID)
+		s.mu.Unlock()
+		delete(sm.sessions, sid)
+		sm.userSessions[userKey] = append(ids[:i], ids[i+1:]...)
+		if agentSessionID != "" && !sm.hasAgentSessionReferenceLocked(agentSessionID) {
+			delete(sm.sessionNames, agentSessionID)
+		}
+		sm.saveLocked()
+		return s, nil
+	}
+	return nil, fmt.Errorf("session %q not found", sessionID)
+}
+
+func (sm *SessionManager) hasAgentSessionReferenceLocked(agentSessionID string) bool {
+	for _, session := range sm.sessions {
+		if session == nil {
+			continue
+		}
+		session.mu.Lock()
+		matches := strings.TrimSpace(session.AgentSessionID) == agentSessionID
+		session.mu.Unlock()
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
 func (sm *SessionManager) ListSessions(userKey string) []*Session {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -262,8 +336,10 @@ func (sm *SessionManager) RenameActiveSession(userKey, name string) *Session {
 	if s == nil {
 		return nil
 	}
+	s.mu.Lock()
 	s.Name = name
 	s.UpdatedAt = time.Now()
+	s.mu.Unlock()
 	sm.saveLocked()
 	return s
 }
@@ -274,9 +350,13 @@ func (sm *SessionManager) RenameByAgentSessionID(agentSessionID, name string) {
 	defer sm.mu.Unlock()
 
 	for _, s := range sm.sessions {
-		if s != nil && s.AgentSessionID == agentSessionID {
-			s.Name = name
-			s.UpdatedAt = time.Now()
+		if s != nil {
+			s.mu.Lock()
+			if s.AgentSessionID == agentSessionID {
+				s.Name = name
+				s.UpdatedAt = time.Now()
+			}
+			s.mu.Unlock()
 		}
 	}
 	sm.saveLocked()

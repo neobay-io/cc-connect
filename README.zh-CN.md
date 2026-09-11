@@ -725,8 +725,9 @@ cc-connect daemon uninstall
 
 ```
 /new [名称]            创建新会话
-/list                  列出当前项目的会话列表
-/switch <id>           切换到指定会话
+/list                  列出当前聊天的 cc-connect 会话
+/switch <序号>         切换到列表中的 cc-connect 会话
+/delete <序号>         删除 cc-connect 会话记录（保留 Agent transcript）
 /current               查看当前活跃会话
 /history [n]           查看最近 n 条消息（默认 10）
 /provider [list|add|remove|switch] 管理 API Provider
